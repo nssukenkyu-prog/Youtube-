@@ -1,0 +1,34 @@
+name: Zoom Processor
+
+on:
+  schedule:
+    # 1時間に1回実行 (毎時0分)
+    - cron: '0 * * * *'
+  workflow_dispatch: # 手動実行ボタンも有効化
+
+jobs:
+  process_meetings:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Processor
+        env:
+          # GitHubのSettings > Secretsにこれらを設定します
+          G_CLIENT_ID: ${{ secrets.G_CLIENT_ID }}
+          G_CLIENT_SECRET: ${{ secrets.G_CLIENT_SECRET }}
+          G_REFRESH_TOKEN: ${{ secrets.G_REFRESH_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LINE_ACCESS_TOKEN: ${{ secrets.LINE_ACCESS_TOKEN }}
+          LINE_TO_ID: ${{ secrets.LINE_TO_ID }}
+          ROOT_FOLDER_ID: ${{ secrets.ROOT_FOLDER_ID }}
+        run: python main.py
