@@ -6,10 +6,6 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
 from openai import OpenAI
-from reportlab.pdfgen import canvas
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.lib.pagesizes import A4
 import io
 
 # === 設定 (環境変数から取得) ===
@@ -47,12 +43,21 @@ def get_youtube_service():
 
 def main():
     print("=== 処理開始 ===")
-    drive = get_drive_service()
-    
+    try:
+        drive = get_drive_service()
+    except Exception as e:
+        print(f"認証エラー: {e}")
+        return
+
     # ルートフォルダ内のサブフォルダを検索
-    query = f"'{ROOT_FOLDER_ID}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    results = drive.files().list(q=query, fields="files(id, name)").execute()
-    folders = results.get('files', [])
+    try:
+        query = f"'{ROOT_FOLDER_ID}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        results = drive.files().list(q=query, fields="files(id, name)").execute()
+        folders = results.get('files', [])
+    except Exception as e:
+        print(f"フォルダ検索エラー: {e}")
+        print("ROOT_FOLDER_IDが正しいか、共有設定ができているか確認してください。")
+        return
 
     for folder in folders:
         # [Processed] が付いていないフォルダのみ対象
@@ -84,34 +89,49 @@ def process_folder(drive, folder):
         return
 
     print("★ 字幕ダウンロード中...")
-    transcript_text = drive.files().get_media(fileId=transcript_file['id']).execute().decode('utf-8')
+    try:
+        transcript_text = drive.files().get_media(fileId=transcript_file['id']).execute().decode('utf-8')
+    except Exception as e:
+        print(f"字幕読み込みエラー: {e}")
+        return
     
     # 1. OpenAI 要約
     print("★ AI要約生成中...")
-    summary = generate_summary(transcript_text)
+    try:
+        summary = generate_summary(transcript_text)
+    except Exception as e:
+        print(f"OpenAIエラー: {e}")
+        summary = "要約の生成に失敗しました。"
     
-    # 2. PDF作成 & Driveアップロード
-    print("★ PDF作成中...")
-    pdf_link = create_pdf_in_drive(drive, folder_id, folder_name, summary)
+    # 2. PDF作成 (実質テキストファイル) & Driveアップロード
+    print("★ 議事録ファイル保存中...")
+    doc_link = create_pdf_in_drive(drive, folder_id, folder_name, summary)
 
     # 3. YouTube アップロード (動画がある場合)
     youtube_link = "(動画なし)"
     if video_file:
         print(f"★ YouTubeへ動画転送中: {video_file['name']}")
-        youtube_link = upload_video_to_youtube(drive, video_file)
+        try:
+            youtube_link = upload_video_to_youtube(drive, video_file)
+        except Exception as e:
+            print(f"YouTubeアップロードエラー: {e}")
+            youtube_link = "(アップロード失敗)"
     
     # 4. LINE通知
     print("★ LINE通知...")
-    send_line(folder_name, pdf_link, youtube_link)
+    send_line(folder_name, doc_link, youtube_link)
     
     # 5. フォルダ名を変更して処理済みにする
-    new_name = f"[Processed] {folder_name}"
-    drive.files().update(fileId=folder_id, body={'name': new_name}).execute()
-    print(f"完了: {new_name}")
+    try:
+        new_name = f"[Processed] {folder_name}"
+        drive.files().update(fileId=folder_id, body={'name': new_name}).execute()
+        print(f"完了: {new_name}")
+    except Exception as e:
+        print(f"フォルダ名変更エラー: {e}")
 
 def generate_summary(text):
-    # (プロンプトは以前の内容と同じものを設定)
-    system_prompt = "あなたは、日本体育大学スポーツキュアセンター横浜・健志台接骨院および日本体育大学大学院の公式議事録作成者です。入力された「会議の字幕データ」を読み、内容に応じて自動で会議の種類を判定し、適切な形式で出力してください。強調は用いないでください．
+    # ★修正箇所: トリプルクォートに変更しました
+    system_prompt = """あなたは、日本体育大学スポーツキュアセンター横浜・健志台接骨院および日本体育大学大学院の公式議事録作成者です。入力された「会議の字幕データ」を読み、内容に応じて自動で会議の種類を判定し、適切な形式で出力してください。強調は用いないでください．
 【重要：要約レベルの指示】
 1. 「大学院の進捗発表・抄読会」の場合（重要）：
    - 絶対に短くまとめすぎないでください。
@@ -156,7 +176,7 @@ def generate_summary(text):
 20．臨時議題（上記に該当しないもの）
 
 【スタッフミーティング】
-- 上記の全体ミーティング項目に該当しない、または現場運営・日常業務に関する内容を議題として整理する。"
+- 上記の全体ミーティング項目に該当しない、または現場運営・日常業務に関する内容を議題として整理する。"""
     
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -172,14 +192,10 @@ def upload_video_to_youtube(drive, file_info):
     youtube = get_youtube_service()
     
     # 動画ファイルを一時的にローカルにダウンロード
-    # (GitHub Actionsは数GBのディスク容量があるので大丈夫です)
     request = drive.files().get_media(fileId=file_info['id'])
     fh = io.FileIO("temp_video.mp4", "wb")
     downloader = MediaIoBaseUpload(fh, mimetype="video/mp4")
     
-    # 注: 大きなファイル用にDownloaderを使う実装もありますが、
-    # 簡単のため一旦request.execute()でバイナリ取得して保存します
-    # ファイルが巨大すぎる(2GB超)場合はチャンクダウンロードが必要
     file_content = request.execute() 
     with open("temp_video.mp4", "wb") as f:
         f.write(file_content)
@@ -211,10 +227,6 @@ def upload_video_to_youtube(drive, file_info):
     return f"https://youtu.be/{response['id']}"
 
 def create_pdf_in_drive(drive, folder_id, title, text):
-    # 簡易的なテキストファイルとして保存（PDF化は日本語フォント設定が複雑なため、まずはテキスト保存を推奨）
-    # もしPDF必須であればreportlabでフォント読み込みが必要ですが、
-    # ここでは一番確実な「Googleドキュメント作成」ではなく「テキストファイル」または「Markdown」で保存します
-    
     file_metadata = {
         'name': f'議事録_{title}.txt',
         'parents': [folder_id],
@@ -233,19 +245,13 @@ def create_pdf_in_drive(drive, folder_id, title, text):
     return file['webViewLink']
 
 def send_line(title, doc_url, video_url):
-    headers = {
-        "Authorization": f"Bearer {LINE_TOKEN}",
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-    msg = f"\n【議事録完了】\n会議名: {title}\n\n📝 議事録:\n{doc_url}\n\n🎬 YouTube:\n{video_url}"
-    payload = {"message": msg, "to": LINE_TO} # Pushの場合はAPIが変わりますがNotifyならこれ
-    
-    # Messaging API (Push) の場合
+    # Messaging API (Push)
     url = "https://api.line.me/v2/bot/message/push"
     headers = {
         "Authorization": f"Bearer {LINE_TOKEN}",
         "Content-Type": "application/json"
     }
+    msg = f"\n【議事録完了】\n会議名: {title}\n\n📝 議事録:\n{doc_url}\n\n🎬 YouTube:\n{video_url}"
     data = {
         "to": LINE_TO,
         "messages": [{"type": "text", "text": msg.strip()}]
